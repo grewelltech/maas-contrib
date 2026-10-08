@@ -1,0 +1,3 @@
+cloud-initramfs-copymods: package-contains-empty-directory [usr/lib/modules/]
+# one single directory for Dracut modules is needed, see https://github.com/dracutdevs/dracut/issues/2485
+executable-in-usr-lib [usr/lib/dracut/modules.d/*.sh]

@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+PREREQS="cryptsetup"
+case $1 in
+	prereqs) echo "${PREREQS}"; exit 0;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+##
+copy_exec /usr/bin/head /bin
+copy_exec /usr/bin/sha512sum /bin
+copy_exec /sbin/wipefs /sbin
+copy_exec /sbin/cryptsetup /sbin
+copy_exec /sbin/mke2fs /sbin
+
+# this is '||' only in case aesni_intel module isn't built (or others are built in)
+manual_add_modules overlayfs overlay dm_mod dm_crypt aesni_intel || true
+
+# Grab as much true random data as possible, up to 4KB, and stash it into a
+# random seed in the initramfs
+dd if=/dev/random of="${DESTDIR}/.random-seed" bs=1 count=4096 iflag=nonblock >/dev/null 2>&1 || true
+
+# vi: ts=4 noexpandtab

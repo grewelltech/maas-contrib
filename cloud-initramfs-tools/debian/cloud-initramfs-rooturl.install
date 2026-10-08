@@ -1,0 +1,3 @@
+usr/lib/dracut/modules.d/50rooturl
+usr/share/initramfs-tools/hooks/rooturl
+usr/share/initramfs-tools/scripts/*/rooturl

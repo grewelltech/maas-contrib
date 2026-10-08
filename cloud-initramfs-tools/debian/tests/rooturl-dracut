@@ -1,0 +1,82 @@
+#!/usr/bin/bash
+set -eu
+
+# Derived from Dracut TEST-45-SYSTEMD-IMPORT
+
+# shellcheck source=debian/tests/prepare-dracut
+. debian/tests/prepare-dracut
+
+# shellcheck disable=SC2034
+TEST_DESCRIPTION="download and import disk images at boot with systemd-import"
+
+# Uncomment these to debug failures
+#DEBUGFAIL="systemd.show_status=1 systemd.log_level=debug"
+
+test_check() {
+    local binary
+
+    for binary in /usr/lib/systemd/systemd-importd systemd-dissect gzip mksquashfs tar xz zstd; do
+        if ! type -p "$binary" &> /dev/null; then
+            echo "Test needs $binary... Skipping"
+            return 1
+        fi
+    done
+}
+
+client_run() {
+    local test_name="$1"
+    local append="$2"
+
+    client_test_start "$test_name"
+
+    "$testdir"/run-qemu \
+        -device "virtio-net-pci,netdev=lan0" \
+        -netdev "user,id=lan0,net=10.0.2.0/24,dhcpstart=10.0.2.15" \
+        -append "$append $TEST_KERNEL_CMDLINE" \
+        -initrd "$TESTDIR/initramfs.testing"
+    check_qemu_log
+
+    client_test_end
+}
+
+test_run() {
+    local port
+
+    port=$(start_webserver)
+
+    client_run "root=tar:http://server/root.tar.zst" "root=tar:http://10.0.2.2:$port/root.tar.zst"
+    client_run "root=http://server/root.tar.zst" "root=http://10.0.2.2:$port/root.tar.zst"
+
+    client_run "root=tar:http://server/root.tar.xz" "root=tar:http://10.0.2.2:$port/root.tar.xz"
+    client_run "root=http://server/root.tar.xz" "root=http://10.0.2.2:$port/root.tar.xz"
+
+    client_run "root=tar:http://server/root.tgz" "root=tar:http://10.0.2.2:$port/root.tgz"
+    client_run "root=http://server/root.tgz" "root=http://10.0.2.2:$port/root.tgz"
+
+    client_run "root=squash:http://server/root_squashfs.img" "root=squash:http://10.0.2.2:$port/root_squashfs.img"
+    client_run "root=http://server/root.squashfs" "root=http://10.0.2.2:$port/root.squashfs"
+}
+
+test_setup() {
+    # Create plain root filesystem
+    build_client_rootfs "$TESTDIR/rootfs" debian/tests/rooturl-dracut-assertion.sh
+
+    # Create a compressed tarball with the plain rootfs
+    tar -C "$TESTDIR/rootfs" --zstd -cf "$TESTDIR/root.tar.zst" .
+    tar -C "$TESTDIR/rootfs" --xz -cf "$TESTDIR/root.tar.xz" .
+    tar -C "$TESTDIR/rootfs" --gzip -cf "$TESTDIR/root.tgz" .
+
+    # Create a squashfs image with the rootfs
+    mksquashfs "$TESTDIR/rootfs" "$TESTDIR/root_squashfs.img" -quiet -no-progress
+    cp "$TESTDIR/root_squashfs.img" "$TESTDIR/root.squashfs"
+
+    test_dracut \
+        --no-hostonly-cmdline
+}
+
+test_cleanup() {
+    stop_webserver
+}
+
+# shellcheck disable=SC1090
+. "$testdir"/test-functions
