@@ -1,0 +1,287 @@
+import PowerForm from "./PowerForm";
+
+import { Labels } from "@/app/base/components/EditableSection";
+import { Entitlement } from "@/app/settings/views/UserManagement/views/Groups/constants";
+import { PowerTypeNames } from "@/app/store/general/constants";
+import { PowerFieldScope, PowerFieldType } from "@/app/store/general/types";
+import { machineActions } from "@/app/store/machine";
+import type { RootState } from "@/app/store/root/types";
+import * as factory from "@/testing/factories";
+import { authResolvers } from "@/testing/resolvers/auth";
+import { powerTypesResolvers } from "@/testing/resolvers/powerTypes";
+import { systemResolvers } from "@/testing/resolvers/system";
+import {
+  userEvent,
+  screen,
+  setupMockServer,
+  waitFor,
+  renderWithProviders,
+  waitForLoading,
+} from "@/testing/utils";
+
+const mockServer = setupMockServer(
+  authResolvers.getCurrentUser.handler(),
+  authResolvers.getMeEntitlements.handler(),
+  powerTypesResolvers.listPowerTypes.handler(),
+  systemResolvers.getSystemInfo.handler()
+);
+
+const clickEditButton = async () => {
+  const editButton = screen.getAllByRole("button", {
+    name: Labels.EditButton,
+  })[0];
+  await waitFor(() => {
+    expect(editButton).not.toBeAriaDisabled();
+  });
+  await userEvent.click(editButton);
+  await waitForLoading();
+};
+
+let state: RootState;
+beforeEach(() => {
+  state = factory.rootState({
+    general: factory.generalState({
+      powerTypes: factory.powerTypesState({
+        data: [
+          factory.powerType({
+            description: "AMT",
+            fields: [
+              factory.powerField({
+                name: "amt-field",
+                label: "AMT field",
+                field_type: PowerFieldType.STRING,
+                scope: PowerFieldScope.NODE,
+              }),
+            ],
+            name: PowerTypeNames.AMT,
+          }),
+          factory.powerType({
+            description: "APC",
+            fields: [
+              factory.powerField({
+                name: "apc-field",
+                label: "APC field",
+                field_type: PowerFieldType.STRING,
+                scope: PowerFieldScope.NODE,
+              }),
+            ],
+            name: PowerTypeNames.APC,
+          }),
+          factory.powerType({
+            description: "IPMI",
+            fields: [
+              factory.powerField({
+                name: "ip_address",
+                label: "IP address",
+                field_type: PowerFieldType.IP_ADDRESS,
+                scope: PowerFieldScope.NODE,
+              }),
+            ],
+            name: PowerTypeNames.IPMI,
+          }),
+        ],
+        loaded: true,
+      }),
+    }),
+    machine: factory.machineState({
+      items: [
+        factory.machineDetails({
+          permissions: ["edit"],
+          power_type: PowerTypeNames.AMT,
+          system_id: "abc123",
+        }),
+        factory.machineDetails({
+          permissions: ["edit"],
+          power_type: PowerTypeNames.IPMI,
+          system_id: "def456",
+        }),
+      ],
+      statuses: factory.machineStatuses({
+        abc123: factory.machineStatus(),
+        def456: factory.machineStatus(),
+      }),
+    }),
+  });
+});
+
+it("is not editable if machine does not have edit permission", () => {
+  state.machine.items[0].permissions = [];
+
+  renderWithProviders(<PowerForm systemId="abc123" />, { state });
+
+  expect(
+    screen.queryByRole("button", { name: Labels.EditButton })
+  ).not.toBeInTheDocument();
+});
+
+it("is editable if machine has edit permission", () => {
+  state.machine.items[0].permissions = ["edit"];
+
+  renderWithProviders(<PowerForm systemId="abc123" />, { state });
+
+  expect(
+    screen.getAllByRole("button", { name: Labels.EditButton }).length
+  ).not.toBe(0);
+});
+
+it("renders read-only text fields until edit button is pressed", async () => {
+  renderWithProviders(<PowerForm systemId="abc123" />, { state });
+
+  expect(
+    screen.queryByRole("button", { name: "Power type" })
+  ).not.toBeInTheDocument();
+
+  await clickEditButton();
+
+  expect(
+    screen.getByRole("button", { name: "Power type" })
+  ).toBeInTheDocument();
+});
+
+it("can validate IPv6 addresses with a port for IPMI power type", async () => {
+  renderWithProviders(<PowerForm systemId="def456" />, { state });
+
+  await clickEditButton();
+
+  await userEvent.click(screen.getByRole("button", { name: "Power type" }));
+  await userEvent.click(screen.getByRole("option", { name: "IPMI" }));
+
+  await userEvent.clear(screen.getByRole("textbox", { name: "IP address" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "IP address" }),
+    "not an ip address"
+  );
+
+  await userEvent.tab();
+
+  expect(
+    screen.getByText("Please enter a valid IP address.")
+  ).toBeInTheDocument();
+
+  await userEvent.clear(screen.getByRole("textbox", { name: "IP address" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "IP address" }),
+    // This is entered as [2001:db8::1]:8080, since square brackets are
+    // special characters in testing-library user events and can be escaped by doubling.
+    "[[2001:db8::1]:8080"
+  );
+
+  await userEvent.tab();
+
+  expect(
+    screen.queryByText("Please enter a valid IP address.")
+  ).not.toBeInTheDocument();
+});
+
+it("can validate IPv4 addresses with a port for IPMI power type", async () => {
+  renderWithProviders(<PowerForm systemId="def456" />, { state });
+
+  await clickEditButton();
+
+  await userEvent.click(screen.getByRole("button", { name: "Power type" }));
+  await userEvent.click(screen.getByRole("option", { name: "IPMI" }));
+
+  await userEvent.clear(screen.getByRole("textbox", { name: "IP address" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "IP address" }),
+    "not an ip address"
+  );
+
+  await userEvent.tab();
+
+  expect(
+    screen.getByText("Please enter a valid IP address.")
+  ).toBeInTheDocument();
+
+  await userEvent.clear(screen.getByRole("textbox", { name: "IP address" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "IP address" }),
+    "192.168.0.2:8080"
+  );
+
+  await userEvent.tab();
+
+  expect(
+    screen.queryByText("Please enter a valid IP address.")
+  ).not.toBeInTheDocument();
+});
+it("correctly dispatches an action to update a machine's power", async () => {
+  const machine = factory.machineDetails({
+    permissions: ["edit"],
+    power_type: PowerTypeNames.AMT,
+    system_id: "abc123",
+  });
+  state.machine.items = [machine];
+
+  const { store } = renderWithProviders(<PowerForm systemId="abc123" />, {
+    state,
+  });
+
+  await clickEditButton();
+  await userEvent.click(screen.getByRole("button", { name: "Power type" }));
+  await userEvent.click(screen.getByRole("option", { name: "APC" }));
+  await userEvent.clear(screen.getByRole("textbox", { name: "APC field" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "APC field" }),
+    "abcde"
+  );
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  const expectedAction = machineActions.update({
+    extra_macs: machine.extra_macs,
+    power_parameters: {
+      "apc-field": "abcde",
+    },
+    power_type: PowerTypeNames.APC,
+    pxe_mac: machine.pxe_mac,
+    system_id: machine.system_id,
+  });
+  const actualActions = store.getActions();
+  await waitFor(() => {
+    expect(
+      actualActions.find((action) => action.type === expectedAction.type)
+    ).toStrictEqual(expectedAction);
+  });
+});
+
+it("disables the edit button without an edit entitlement for the machine's pool", async () => {
+  state.machine.items[0].pool = factory.modelRef({ id: 5, name: "pool-5" });
+  mockServer.use(
+    authResolvers.getMeEntitlements.handler([
+      factory.entitlement({
+        entitlement: Entitlement.CAN_EDIT_MACHINES,
+        resource_type: "pool",
+        resource_id: 42,
+      }),
+    ])
+  );
+
+  renderWithProviders(<PowerForm systemId="abc123" />, { state });
+
+  await waitFor(() => {
+    expect(
+      screen.getAllByRole("button", { name: Labels.EditButton })[0]
+    ).toBeAriaDisabled();
+  });
+});
+
+it("enables the edit button with a pool-scoped edit entitlement", async () => {
+  state.machine.items[0].pool = factory.modelRef({ id: 5, name: "pool-5" });
+  mockServer.use(
+    authResolvers.getMeEntitlements.handler([
+      factory.entitlement({
+        entitlement: Entitlement.CAN_EDIT_MACHINES,
+        resource_type: "pool",
+        resource_id: 5,
+      }),
+    ])
+  );
+
+  renderWithProviders(<PowerForm systemId="abc123" />, { state });
+
+  await waitFor(() => {
+    expect(
+      screen.getAllByRole("button", { name: Labels.EditButton })[0]
+    ).not.toBeAriaDisabled();
+  });
+});

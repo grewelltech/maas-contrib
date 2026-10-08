@@ -1,0 +1,311 @@
+import type { ReactElement } from "react";
+import { useState } from "react";
+
+import { useSidePanel } from "@canonical/maas-react-components";
+import { Spinner, useToastNotification } from "@canonical/react-components";
+import { useQueryClient } from "@tanstack/react-query";
+import { useDispatch, useSelector } from "react-redux";
+import type { Dispatch } from "redux";
+import * as Yup from "yup";
+
+import DiscoveryAddFormFields from "./DiscoveryAddFormFields";
+import type { DiscoveryAddValues } from "./types";
+import { DeviceType } from "./types";
+
+import { useCreateSwitch } from "@/app/api/query/switches";
+import type { DiscoveryResponse } from "@/app/apiclient";
+import { listDiscoveriesQueryKey } from "@/app/apiclient/@tanstack/react-query.gen";
+import FormikForm from "@/app/base/components/FormikForm";
+import { useCycled, useFetchActions } from "@/app/base/hooks";
+import urls from "@/app/base/urls";
+import { hostnameValidation, MAC_ADDRESS_REGEX } from "@/app/base/validation";
+import { deviceActions } from "@/app/store/device";
+import deviceSelectors from "@/app/store/device/selectors";
+import type { CreateInterfaceParams, Device } from "@/app/store/device/types";
+import { DeviceIpAssignment, DeviceMeta } from "@/app/store/device/types";
+import { domainActions } from "@/app/store/domain";
+import domainSelectors from "@/app/store/domain/selectors";
+import { useFetchMachines } from "@/app/store/machine/utils/hooks";
+import type { RootState } from "@/app/store/root/types";
+import { subnetActions } from "@/app/store/subnet";
+import subnetSelectors from "@/app/store/subnet/selectors";
+import { FetchNodeStatus } from "@/app/store/types/node";
+import { vlanActions } from "@/app/store/vlan";
+import vlanSelectors from "@/app/store/vlan/selectors";
+import { getSwitchErrorMessage } from "@/app/switches/utils";
+import { preparePayload } from "@/app/utils";
+
+export enum Labels {
+  SubmitLabel = "Save",
+  SecondarySubmitParent = "Save and go to machine details",
+  SecondarySubmitNoParent = "Save and go to device listing",
+  SwitchSubmitLabel = "Save and go to switch listing",
+}
+
+type Props = {
+  discovery: DiscoveryResponse;
+};
+
+const formSubmit = (
+  dispatch: Dispatch,
+  discovery: DiscoveryResponse,
+  values: DiscoveryAddValues
+) => {
+  // Clear the errors from the previous submission.
+  if (values.type === DeviceType.DEVICE) {
+    if (!discovery.ip || !discovery.mac_address || !discovery.subnet_id) {
+      return;
+    }
+    dispatch(
+      deviceActions.create({
+        domain: { name: values.domain },
+        extra_macs: [],
+        hostname: values.hostname,
+        interfaces: [
+          {
+            ip_address: discovery.ip,
+            ip_assignment: values.ip_assignment,
+            mac: discovery.mac_address,
+            subnet: discovery.subnet_id,
+          },
+        ],
+        parent: values.parent || "",
+        primary_mac: discovery.mac_address,
+      })
+    );
+  } else {
+    dispatch(
+      deviceActions.createInterface(
+        preparePayload(
+          {
+            [DeviceMeta.PK]: values.system_id,
+            ip_address: discovery.ip,
+            ip_assignment: values.ip_assignment,
+            mac_address: discovery.mac_address,
+            name: values.hostname,
+            subnet: discovery.subnet_id?.toString(),
+            vlan: discovery.vlan_id,
+          },
+          [],
+          [],
+          true
+        ) as CreateInterfaceParams
+      )
+    );
+  }
+};
+
+const setRedirectURL = (
+  values: DiscoveryAddValues,
+  setRedirect: (redirect: string | null) => void
+) => {
+  setRedirect(
+    values.parent
+      ? urls.machines.machine.index({ id: values.parent })
+      : urls.devices.index
+  );
+};
+
+const DiscoveryAddSchema = Yup.object().shape({
+  [DeviceMeta.PK]: Yup.string().when("type", {
+    is: DeviceType.INTERFACE,
+    then: Yup.string().required(
+      "A device is required when adding an interface."
+    ),
+  }),
+  domain: Yup.string(),
+  hostname: hostnameValidation,
+  ip_assignment: Yup.string(),
+  parent: Yup.string(),
+  type: Yup.string(),
+  name: Yup.string(),
+  image: Yup.string(),
+  mac_address: Yup.string().when("type", {
+    is: DeviceType.SWITCH,
+    then: Yup.string()
+      .required("MAC address is required")
+      .matches(MAC_ADDRESS_REGEX, "Invalid MAC address"),
+  }),
+});
+
+const DiscoveryAddForm = ({ discovery }: Props): ReactElement => {
+  const { closeSidePanel } = useSidePanel();
+
+  const dispatch = useDispatch();
+  const { success } = useToastNotification();
+  const [redirect, setRedirect] = useState<string | null>(null);
+  const initialDeviceType = DeviceType.DEVICE;
+  const [deviceType, setDeviceType] = useState<DeviceType>(initialDeviceType);
+  const [device, setDevice] = useState<Device[DeviceMeta.PK] | null>(null);
+  const createSwitch = useCreateSwitch();
+  const isSwitch = deviceType === DeviceType.SWITCH;
+  const devicesLoaded = useSelector(deviceSelectors.loaded);
+  const defaultDomain = useSelector(domainSelectors.getDefault);
+  let hostname = discovery.hostname;
+  let domainName: string | null = null;
+  if (hostname?.includes(".")) {
+    [hostname, domainName] = hostname?.split(".");
+  }
+  const domainByName = useSelector((state: RootState) =>
+    domainSelectors.getByName(state, domainName)
+  );
+  const domainsLoaded = useSelector(domainSelectors.loaded);
+  let errors = useSelector(deviceSelectors.errors);
+  const saved = useSelector(deviceSelectors.saved);
+  const saving = useSelector(deviceSelectors.saving);
+  const creatingInterface = useSelector((state: RootState) =>
+    deviceSelectors.getStatusForDevice(state, device, "creatingInterface")
+  );
+  const creatingInterfaceErrors = useSelector((state: RootState) =>
+    deviceSelectors.eventErrorsForDevices(state, device, "creatingInterface")
+  );
+  const subnetsLoaded = useSelector(subnetSelectors.loaded);
+  const vlansLoaded = useSelector(vlanSelectors.loaded);
+  const [createdInterface] = useCycled(
+    !creatingInterface && creatingInterfaceErrors.length === 0
+  );
+  const processing = isSwitch
+    ? createSwitch.isPending
+    : deviceType === DeviceType.DEVICE
+      ? saving
+      : creatingInterface;
+  const processed = isSwitch
+    ? createSwitch.isSuccess
+    : deviceType === DeviceType.DEVICE
+      ? saved
+      : createdInterface;
+  const { loaded: machinesLoaded } = useFetchMachines({
+    filters: { status: FetchNodeStatus.DEPLOYED },
+  });
+
+  const queryClient = useQueryClient();
+
+  useFetchActions([
+    deviceActions.fetch,
+    domainActions.fetch,
+    subnetActions.fetch,
+    vlanActions.fetch,
+  ]);
+
+  if (
+    !devicesLoaded ||
+    !domainsLoaded ||
+    !machinesLoaded ||
+    !subnetsLoaded ||
+    !vlansLoaded
+  ) {
+    return <Spinner />;
+  }
+
+  // When creating an interface the error will get returned for "name" but this
+  // form uses "hostname" for the field name.
+  if (errors && typeof errors === "object" && "name" in errors) {
+    errors = { ...errors, hostname: errors.name };
+    delete errors.name;
+  }
+
+  return (
+    <FormikForm<DiscoveryAddValues>
+      allowUnchanged
+      aria-label="Add discovery"
+      className="u-width--full"
+      errors={isSwitch ? getSwitchErrorMessage(createSwitch.error) : errors}
+      initialValues={{
+        [DeviceMeta.PK]: "",
+        domain: (domainByName || defaultDomain)?.name || "",
+        hostname: hostname || "",
+        ip_assignment: DeviceIpAssignment.DYNAMIC,
+        parent: "",
+        type: initialDeviceType,
+        name: "",
+        mac_address: discovery.mac_address || "",
+        image: "",
+      }}
+      onCancel={closeSidePanel}
+      onSaveAnalytics={{
+        action: "Add discovery",
+        category: "Dashboard",
+        label: "Add discovery form",
+      }}
+      onSubmit={(values) => {
+        if (values.type === DeviceType.SWITCH) {
+          // The primary "Save" button should not redirect anywhere.
+          setRedirect(null);
+          createSwitch.mutate({
+            body: {
+              mac_address: values.mac_address ?? "",
+              name: values.name,
+              image: values.image,
+            },
+          });
+          return;
+        }
+        // The normal submit button should not redirect anywhere.
+        setRedirect(null);
+        formSubmit(dispatch, discovery, values);
+      }}
+      onSuccess={async (values) => {
+        // Refetch the discoveries so that this discovery will get removed
+        // from the list.
+        await queryClient.invalidateQueries({
+          queryKey: listDiscoveriesQueryKey(),
+        });
+        if (!redirect) {
+          closeSidePanel();
+          let device: string;
+          if (values.type === DeviceType.SWITCH) {
+            device = values.name || "A switch";
+          } else if (values.hostname) {
+            device = values.hostname;
+          } else if (values.type === DeviceType.INTERFACE) {
+            device = `An ${values.type}`;
+          } else {
+            device = `A ${values.type}`;
+          }
+          success(`${device} has been added.`);
+        }
+      }}
+      saved={processed}
+      savedRedirect={redirect}
+      saving={processing}
+      secondarySubmit={
+        isSwitch
+          ? (values) => {
+              // The switch secondary submit should redirect to the switch
+              // listing.
+              setRedirect(urls.switches.index);
+              createSwitch.mutate({
+                body: {
+                  mac_address: values.mac_address ?? "",
+                  name: values.name,
+                  image: values.image,
+                },
+              });
+            }
+          : (values) => {
+              // The secondary submit should redirect to the device/devices.
+              setRedirectURL(values, setRedirect);
+              formSubmit(dispatch, discovery, values);
+            }
+      }
+      secondarySubmitLabel={
+        isSwitch
+          ? Labels.SwitchSubmitLabel
+          : (values) =>
+              values.parent
+                ? Labels.SecondarySubmitParent
+                : Labels.SecondarySubmitNoParent
+      }
+      submitLabel={Labels.SubmitLabel}
+      validationSchema={DiscoveryAddSchema}
+    >
+      <DiscoveryAddFormFields
+        discovery={discovery}
+        setDevice={setDevice}
+        setDeviceType={setDeviceType}
+      />
+    </FormikForm>
+  );
+};
+
+export default DiscoveryAddForm;

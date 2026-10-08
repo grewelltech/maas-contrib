@@ -1,0 +1,25 @@
+import { NodeActions } from "../store/types/node";
+
+import type urls from "./urls";
+
+export const ControllerDetailsTabLabels: Record<
+  Exclude<keyof typeof urls.controller, "index">,
+  string
+> = {
+  summary: "Summary",
+  vlans: "VLANs",
+  network: "Network",
+  storage: "Storage",
+  pciDevices: "PCI devices",
+  usbDevices: "USB",
+  commissioning: "Commissioning",
+  logs: "Logs",
+  configuration: "Configuration",
+};
+
+export const ControllerActionConfirmations: NodeActions[] = [
+  NodeActions.ON,
+  NodeActions.OFF,
+  NodeActions.OVERRIDE_FAILED_TESTING,
+  NodeActions.DELETE,
+];

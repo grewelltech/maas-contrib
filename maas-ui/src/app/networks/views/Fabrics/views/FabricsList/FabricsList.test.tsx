@@ -1,0 +1,61 @@
+import FabricsList from "./FabricsList";
+
+import { DeleteFabric } from "@/app/networks/views/Fabrics/components";
+import { authResolvers } from "@/testing/resolvers/auth";
+import { fabricsResolvers, mockFabrics } from "@/testing/resolvers/fabrics";
+import {
+  mockModal,
+  renderWithProviders,
+  screen,
+  setupMockServer,
+  userEvent,
+  waitFor,
+} from "@/testing/utils";
+
+setupMockServer(
+  fabricsResolvers.listFabrics.handler(),
+  authResolvers.getCurrentUser.handler(),
+  authResolvers.getMeEntitlements.handler()
+);
+const { mockOpen } = await mockModal();
+
+describe("FabricsList", () => {
+  it("uses the correct window title", async () => {
+    renderWithProviders(<FabricsList />);
+
+    expect(document.title).toBe("Fabrics | MAAS");
+  });
+
+  it("renders the Fabrics table", () => {
+    renderWithProviders(<FabricsList />);
+
+    expect(
+      screen.getByRole("treegrid", { name: "Fabrics table" })
+    ).toBeInTheDocument();
+  });
+
+  it("renders the DeleteFabric form", async () => {
+    renderWithProviders(<FabricsList />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(`${mockFabrics.items[0].name}`)
+      ).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByRole("button", { name: "Delete" })[0]
+      ).not.toBeAriaDisabled();
+    });
+    await userEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+
+    expect(mockOpen).toHaveBeenCalledWith({
+      component: DeleteFabric,
+      title: "Delete fabric",
+      props: {
+        id: mockFabrics.items[0].id,
+      },
+    });
+  });
+});

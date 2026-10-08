@@ -1,0 +1,71 @@
+import { useMemo } from "react";
+
+import { useSidePanel } from "@canonical/maas-react-components";
+import type { ColumnDef } from "@tanstack/react-table";
+
+import TableActions from "@/app/base/components/TableActions";
+import { useModal } from "@/app/base/modal-context";
+import { LicenseKeyEdit } from "@/app/settings/views/LicenseKeys/components";
+import LicenseKeyDelete from "@/app/settings/views/LicenseKeys/components/LicenseKeyDelete/LicenseKeyDelete";
+import type { LicenseKeys } from "@/app/store/licensekeys/types";
+
+type LicenseKeysColumnDef = ColumnDef<LicenseKeys, Partial<LicenseKeys>>;
+
+const useLicenseKeyTableColumns = ({
+  canEdit,
+}: {
+  canEdit: boolean;
+}): LicenseKeysColumnDef[] => {
+  const { openSidePanel } = useSidePanel();
+  const { openModal } = useModal();
+
+  return useMemo(
+    () => [
+      {
+        id: "osystem",
+        accessorKey: "osystem",
+        enableSorting: true,
+        header: "Operating System",
+      },
+      {
+        id: "distro_series",
+        accessorKey: "distro_series",
+        enableSorting: true,
+        header: "Distro Series",
+      },
+      {
+        id: "actions",
+        accessorKey: "license_key",
+        header: "Actions",
+        cell: ({ row: { original } }) => (
+          <TableActions
+            deleteDisabled={!canEdit}
+            editDisabled={!canEdit}
+            onDelete={() => {
+              openModal({
+                component: LicenseKeyDelete,
+                title: "Delete license key",
+                props: {
+                  licenseKey: original,
+                },
+              });
+            }}
+            onEdit={() => {
+              openSidePanel({
+                component: LicenseKeyEdit,
+                title: "Edit license key",
+                props: {
+                  osystem: original.osystem,
+                  distro_series: original.distro_series,
+                },
+              });
+            }}
+          />
+        ),
+      },
+    ],
+    [canEdit, openModal, openSidePanel]
+  );
+};
+
+export default useLicenseKeyTableColumns;

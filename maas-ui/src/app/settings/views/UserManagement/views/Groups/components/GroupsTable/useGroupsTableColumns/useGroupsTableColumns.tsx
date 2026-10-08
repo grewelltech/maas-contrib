@@ -1,0 +1,90 @@
+import { useSidePanel } from "@canonical/maas-react-components";
+import type { ColumnDef } from "@tanstack/react-table";
+import { Link } from "react-router";
+
+import DeleteGroup from "../../DeleteGroup";
+import EditGroup from "../../EditGroup";
+
+import type { UserGroupResponse } from "@/app/apiclient";
+import TableActions from "@/app/base/components/TableActions";
+import { useModal } from "@/app/base/modal-context";
+import urls from "@/app/settings/urls";
+
+type GroupsListColumnData = UserGroupResponse & {
+  statistics?: {
+    user_count: number;
+  };
+};
+
+export type GroupsListColumnDef = ColumnDef<
+  GroupsListColumnData,
+  Partial<GroupsListColumnData>
+>;
+
+const useGroupsTableColumns = ({
+  canEdit,
+}: {
+  canEdit: boolean;
+}): GroupsListColumnDef[] => {
+  const { openSidePanel } = useSidePanel();
+  const { openModal } = useModal();
+  return [
+    {
+      id: "name",
+      accessorKey: "name",
+      enableSorting: true,
+      cell: ({
+        row: {
+          original: { id, name },
+        },
+      }) => <Link to={urls.userManagement.group.index({ id })}>{name}</Link>,
+    },
+    {
+      id: "description",
+      accessorKey: "description",
+      enableSorting: false,
+    },
+    {
+      id: "user_count",
+      accessorKey: "user_count",
+      enableSorting: true,
+      header: "User count",
+      cell: ({
+        row: {
+          original: { statistics },
+        },
+      }) => statistics?.user_count,
+    },
+    {
+      id: "actions",
+      accessorKey: "actions",
+      enableSorting: false,
+      cell: ({
+        row: {
+          original: { id, statistics },
+        },
+      }) => (
+        <TableActions
+          deleteDisabled={!canEdit}
+          editDisabled={!canEdit}
+          onDelete={() => {
+            openModal({
+              component: DeleteGroup,
+              props: { id, user_count: statistics?.user_count ?? 0 },
+              title: "Delete group",
+            });
+          }}
+          onEdit={() => {
+            openSidePanel({
+              component: EditGroup,
+              props: { id },
+              title: "Edit group",
+            });
+          }}
+        />
+      ),
+    },
+  ] as GroupsListColumnDef[];
+};
+
+export default useGroupsTableColumns;

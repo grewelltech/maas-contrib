@@ -1,0 +1,289 @@
+import type {
+  ComponentType,
+  FocusEventHandler,
+  ReactElement,
+  ReactNode,
+} from "react";
+import { useEffect } from "react";
+
+import type { CustomSelectProps } from "@canonical/react-components";
+import {
+  CustomSelect,
+  Notification,
+  Spinner,
+  Tooltip,
+} from "@canonical/react-components";
+import { useFormikContext } from "formik";
+import { useSelector } from "react-redux";
+
+import BasePowerField from "./BasePowerField";
+import IPMIPowerFields from "./IPMIPowerFields";
+import type { LXDPowerFieldsProps } from "./LXDPowerFields";
+import LXDPowerFields from "./LXDPowerFields";
+
+import { usePowerTypes } from "@/app/api/query/powerTypes";
+import { useSystemInfo } from "@/app/api/query/system";
+import FormikField from "@/app/base/components/FormikField";
+import { FormikFieldChangeError } from "@/app/base/components/FormikField/FormikField";
+import { useFetchActions } from "@/app/base/hooks";
+import type { AnyObject } from "@/app/base/types";
+import { generalActions } from "@/app/store/general";
+import { PowerTypeNames } from "@/app/store/general/constants";
+import { powerTypes as powerTypesSelectors } from "@/app/store/general/selectors";
+import { PowerFieldScope } from "@/app/store/general/types";
+import {
+  getFieldsInScope,
+  getPowerTypeFromName,
+} from "@/app/store/general/utils";
+import type { PowerParameters } from "@/app/store/types/node";
+
+export const POWER_VERIFY_SSL_FIELD_NAME = "power_verify_ssl";
+
+export const SSL_VERIFICATION_ENABLED_VALUE = "y";
+
+// These power types connect over HTTPS; when FIPS is active their SSL
+// verification must always be on, so the field is locked on.
+export const SSL_VERIFICATION_ENFORCED_POWER_TYPES: string[] = [
+  PowerTypeNames.WEBHOOK,
+  PowerTypeNames.PROXMOX,
+  PowerTypeNames.HMCZ,
+];
+
+type Props = {
+  customFieldProps?: {
+    [PowerTypeNames.LXD]?: Partial<LXDPowerFieldsProps>;
+  };
+  disableSelect?: boolean;
+  forChassis?: boolean;
+  powerParametersValueName?: string;
+  powerTypeValueName?: string;
+  fieldScopes?: PowerFieldScope[];
+  showSelect?: boolean;
+};
+
+// CustomSelect forwards onBlur to Field but omits it from its declared props.
+const PowerTypeSelect: ComponentType<
+  CustomSelectProps & { onBlur: FocusEventHandler<HTMLDivElement> }
+> = CustomSelect;
+
+export const PowerTypeFields = <V extends AnyObject>({
+  customFieldProps,
+  disableSelect = false,
+  forChassis = false,
+  powerParametersValueName = "power_parameters",
+  powerTypeValueName = "power_type",
+  fieldScopes = [PowerFieldScope.BMC, PowerFieldScope.NODE],
+  showSelect = true,
+}: Props): ReactElement => {
+  const allPowerTypes = useSelector(powerTypesSelectors.get);
+  const chassisPowerTypes = useSelector(powerTypesSelectors.canProbe);
+  const powerTypesLoaded = useSelector(powerTypesSelectors.loaded);
+  const {
+    handleBlur,
+    initialErrors,
+    initialTouched,
+    setErrors,
+    setFieldValue,
+    setTouched,
+    values,
+  } = useFormikContext<V>();
+
+  useFetchActions([generalActions.fetchPowerTypes]);
+
+  const systemInfo = useSystemInfo();
+  const powerTypesResponse = usePowerTypes();
+  const powerControlsAvailable =
+    powerTypesLoaded && systemInfo.isSuccess && powerTypesResponse.isSuccess;
+  const complianceError = systemInfo.error || powerTypesResponse.error;
+
+  const powerTypesResponseData = powerTypesResponse.data?.items || [];
+  const fipsDisabledPowerTypes = powerTypesResponseData.filter(
+    (powerType) => !powerType.fips_supported
+  );
+  const fipsActive = systemInfo.data?.fips_active;
+  const isPowerTypeDisabled = (name: string) =>
+    fipsActive &&
+    fipsDisabledPowerTypes.some((powerType) => powerType.name === name);
+
+  // Only power types that can probe are suitable for use when adding a chassis.
+  const powerTypes = forChassis ? chassisPowerTypes : allPowerTypes;
+
+  // Generate field content depending on loading status, custom field content
+  // if provided, or on the fields of the selected power type.
+  let fieldContent: ReactNode = null;
+  const selectedPowerType = powerTypes.find(
+    (type) => type.name === values[powerTypeValueName]
+  );
+
+  const sslVerificationEnforced = Boolean(
+    fipsActive &&
+    selectedPowerType &&
+    SSL_VERIFICATION_ENFORCED_POWER_TYPES.includes(selectedPowerType.name)
+  );
+  const verifySslFieldName = `${powerParametersValueName}.${POWER_VERIFY_SSL_FIELD_NAME}`;
+  const verifySslFieldValue = (
+    values[powerParametersValueName] as PowerParameters | undefined
+  )?.[POWER_VERIFY_SSL_FIELD_NAME];
+
+  // Force SSL verification on for power types that require it, regardless of
+  // what value the field previously had or defaults to.
+  useEffect(() => {
+    if (
+      sslVerificationEnforced &&
+      verifySslFieldValue !== SSL_VERIFICATION_ENABLED_VALUE
+    ) {
+      setFieldValue(verifySslFieldName, SSL_VERIFICATION_ENABLED_VALUE).catch(
+        (reason: unknown) => {
+          throw new FormikFieldChangeError(
+            verifySslFieldName,
+            "setFieldValue",
+            String(reason)
+          );
+        }
+      );
+    }
+  }, [
+    setFieldValue,
+    sslVerificationEnforced,
+    verifySslFieldName,
+    verifySslFieldValue,
+  ]);
+
+  if (complianceError) {
+    fieldContent = (
+      <Notification
+        role="alert"
+        severity="negative"
+        title="Error while fetching power type compliance information"
+      >
+        {complianceError.message}
+      </Notification>
+    );
+  } else if (!powerControlsAvailable) {
+    fieldContent = <Spinner text="Loading..." />;
+  } else if (selectedPowerType) {
+    const fieldsInScope = getFieldsInScope(selectedPowerType, fieldScopes);
+    switch (selectedPowerType.name) {
+      case PowerTypeNames.IPMI:
+        fieldContent = (
+          <IPMIPowerFields
+            fields={fieldsInScope}
+            fipsActive={fipsActive}
+            powerParametersValueName={powerParametersValueName}
+          />
+        );
+        break;
+      case PowerTypeNames.LXD:
+        fieldContent = (
+          <LXDPowerFields
+            fields={fieldsInScope}
+            powerParametersValueName={powerParametersValueName}
+            {...(customFieldProps?.lxd || {})}
+          />
+        );
+        break;
+      default:
+        fieldContent = fieldsInScope.map((field) => (
+          <BasePowerField
+            disabled={
+              sslVerificationEnforced &&
+              field.name === POWER_VERIFY_SSL_FIELD_NAME
+            }
+            field={field}
+            key={field.name}
+            powerParametersValueName={powerParametersValueName}
+          />
+        ));
+    }
+  }
+
+  return (
+    <>
+      {showSelect && (
+        <FormikField
+          component={PowerTypeSelect}
+          disabled={!powerControlsAvailable || disableSelect}
+          label="Power type"
+          name={powerTypeValueName}
+          onBlur={handleBlur(powerTypeValueName)}
+          onChange={async (value: string) => {
+            // CustomSelect can emit keyboard selections for disabled options.
+            if (!powerControlsAvailable || isPowerTypeDisabled(value)) {
+              return;
+            }
+
+            // Reset errors and touched formik state when selecting a new power
+            // type, in order to start validation from new.
+
+            // CustomSelect passes the raw string value, not an event, so set
+            // the field directly rather than via formik's handleChange.
+            await setFieldValue(powerTypeValueName, value).catch(
+              (reason: unknown) => {
+                throw new FormikFieldChangeError(
+                  powerTypeValueName,
+                  "setFieldValue",
+                  String(reason)
+                );
+              }
+            );
+            setErrors(initialErrors);
+            await setTouched(initialTouched);
+
+            const powerType = getPowerTypeFromName(powerTypes, value);
+            // Explicitly set the fields of the selected power type to defaults.
+            // This is necessary because some field names are shared across
+            // power types (e.g. "power_address"), meaning the value would otherwise
+            // persist and appear to be a default value, even though it isn't.
+            if (powerType) {
+              powerType.fields.forEach((field) => {
+                setFieldValue(
+                  `${powerParametersValueName}.${field.name}`,
+                  field.default || ""
+                ).catch((reason: unknown) => {
+                  throw new FormikFieldChangeError(
+                    `${powerParametersValueName}.${field.name}`,
+                    "setFieldValue",
+                    reason as string
+                  );
+                });
+              });
+            }
+          }}
+          options={[
+            { label: "Select power type", value: "", disabled: true },
+            ...powerTypes.map((powerType) => ({
+              key: `power-type-${powerType.name}`,
+              label: (
+                <>
+                  <Tooltip
+                    message={
+                      isPowerTypeDisabled(powerType.name)
+                        ? `Disabled due to ${
+                            fipsDisabledPowerTypes.find(
+                              (type) => type.name === powerType.name
+                            )?.fips_unsupported_reason ?? "FIPS incompatibility"
+                          }`
+                        : ""
+                    }
+                    position="left"
+                  >
+                    {powerType.description}
+                  </Tooltip>
+                </>
+              ),
+              text: powerType.description,
+              value: powerType.name,
+              disabled: isPowerTypeDisabled(powerType.name),
+            })),
+          ]}
+          required
+          searchable="never"
+          value={`${values[powerTypeValueName]}`}
+        />
+      )}
+      {fieldContent}
+    </>
+  );
+};
+
+export default PowerTypeFields;
