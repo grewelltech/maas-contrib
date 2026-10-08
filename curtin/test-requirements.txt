@@ -1,0 +1,10 @@
+coverage
+flake8
+jsonschema
+parameterized
+pip
+pyflakes
+pytest
+virtualenv
+wheel
+git+https://salsa.debian.org/apt-team/python-apt@2.4.y
