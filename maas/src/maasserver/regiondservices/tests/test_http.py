@@ -1,0 +1,437 @@
+# Copyright 2018-2025 Canonical Ltd.  This software is licensed under the
+# GNU Affero General Public License version 3 (see the file LICENSE).
+
+import os
+from pathlib import Path
+from unittest.mock import Mock
+
+from twisted.internet.defer import inlineCallbacks
+
+import maascommon.fips as fips_module
+import maascommon.worker as worker_module
+from maascommon.worker import get_worker_ids
+from maasserver.listener import notify, PostgresListenerUnregistrationError
+from maasserver.models import Config
+from maasserver.regiondservices import certificate_expiration_check, http
+from maasserver.secrets import SecretManager
+from maasserver.testing.testcase import MAASTransactionServerTestCase
+from maasserver.triggers.testing import TransactionalHelpersMixin
+from maasserver.utils.threads import deferToDatabase
+from maastesting.crochet import wait_for
+from provisioningserver.testing.certificates import (
+    get_sample_cert_with_cacerts,
+)
+import provisioningserver.utils.network as network_module
+from provisioningserver.utils.twisted import DeferredValue
+
+wait_for_reactor = wait_for()
+
+
+class TestRegionHTTPService(
+    TransactionalHelpersMixin, MAASTransactionServerTestCase
+):
+    def create_tls_config(self):
+        cert = get_sample_cert_with_cacerts()
+
+        def _create_config_in_db():
+            Config.objects.set_config("tls_port", 5443)
+            SecretManager().set_composite_secret(
+                "tls",
+                {
+                    "key": cert.private_key_pem(),
+                    "cert": cert.certificate_pem(),
+                    "cacert": cert.ca_certificates_pem(),
+                },
+            )
+            # manually send a notification to emulate what TLS config does
+            notify("sys_reverse_proxy")
+
+        yield deferToDatabase(_create_config_in_db)
+
+    @wait_for_reactor
+    @inlineCallbacks
+    def test_configure_and_reload(self):
+        service = http.RegionHTTPService()
+        mock_reloadService = self.patch(http.service_monitor, "reloadService")
+        mock_configure = self.patch(service, "_configure")
+        mock_cert_check = self.patch(
+            certificate_expiration_check, "check_tls_certificate"
+        )
+
+        yield from self.create_tls_config()
+        yield service.startService()
+        yield service.stopService()
+        mock_configure.assert_called_once()
+        mock_reloadService.assert_called_once_with("reverse_proxy")
+        mock_cert_check.assert_called_once_with()
+
+    def test_configure_not_snap(self):
+        cert = get_sample_cert_with_cacerts()
+        # MAASDataFixture updates `MAAS_DATA` in the environment to point to this new location.
+        data_path = os.getenv("MAAS_DATA")
+        boot_resources_dir = f"{data_path}/image-storage"
+        self.patch(
+            worker_module,
+            "REGIOND_SOCKET_PATH",
+            f"{data_path}/maas-regiond-webapp.sock",
+        )
+
+        tempdir = self.make_dir()
+        nginx_conf = Path(tempdir) / "regiond.nginx.conf"
+        nginx_stream_conf = Path(tempdir) / "regiond.nginx.stream.conf"
+        service = http.RegionHTTPService()
+        self.patch(http, "compose_http_config_path").side_effect = [
+            str(nginx_conf),
+            str(nginx_stream_conf),
+        ]
+
+        mock_create_cert_files = self.patch(service, "_create_cert_files")
+        mock_create_cert_files.return_value = ("key_path", "cert_path")
+
+        service._configure(http._Configuration(cert, port=5443))
+
+        nginx_config = nginx_conf.read_text()
+
+        worker_ids = get_worker_ids()
+        for worker_id in worker_ids:
+            self.assertIn(
+                f"{data_path}/maas-regiond-webapp.sock.{worker_id};",
+                nginx_config,
+            )
+        self.assertIn("root /usr/share/maas/web/static;", nginx_config)
+        self.assertIn("listen 5443 ssl http2;", nginx_config)
+        self.assertIn("ssl_certificate cert_path;", nginx_config)
+        self.assertIn("ssl_certificate_key key_path;", nginx_config)
+        self.assertIn(f"root {boot_resources_dir};", nginx_config)
+
+        nginx_stream_config = nginx_stream_conf.read_text()
+        self.assertIn("listen 5242;", nginx_stream_config)
+        self.assertIn(
+            f"proxy_pass unix:{data_path}/internalapiserver-http.sock;",
+            nginx_stream_config,
+        )
+
+    def test_configure_in_snap(self):
+        cert = get_sample_cert_with_cacerts()
+        data_path = os.getenv("MAAS_DATA")
+        self.patch(
+            os,
+            "environ",
+            {
+                "SNAP": "/snap/maas/5443",
+                "MAAS_HTTP_CONFIG_DIR": os.getenv("MAAS_DATA"),
+                "MAAS_DATA": data_path,
+            },
+        )
+        self.patch(
+            worker_module,
+            "REGIOND_SOCKET_PATH",
+            "/snap/maas/maas-regiond-webapp.sock",
+        )
+        boot_resources_dir = f"{data_path}/image-storage"
+
+        tempdir = self.make_dir()
+        nginx_conf = Path(tempdir) / "regiond.nginx.conf"
+        nginx_stream_conf = Path(tempdir) / "regiond.nginx.stream.conf"
+        service = http.RegionHTTPService()
+        self.patch(http, "compose_http_config_path").side_effect = [
+            str(nginx_conf),
+            str(nginx_stream_conf),
+        ]
+
+        mock_create_cert_files = self.patch(service, "_create_cert_files")
+        mock_create_cert_files.return_value = ("key_path", "cert_path")
+
+        service._configure(http._Configuration(cert=cert, port=5443))
+
+        nginx_config = nginx_conf.read_text()
+        worker_ids = get_worker_ids()
+        for worker_id in worker_ids:
+            self.assertIn(
+                f"server unix:/snap/maas/maas-regiond-webapp.sock.{worker_id};",
+                nginx_config,
+            )
+        self.assertIn(
+            "root /snap/maas/5443/usr/share/maas/web/static;", nginx_config
+        )
+        self.assertIn("listen 5443 ssl http2;", nginx_config)
+        self.assertIn("ssl_certificate cert_path;", nginx_config)
+        self.assertIn("ssl_certificate_key key_path;", nginx_config)
+        self.assertIn(f"root {boot_resources_dir};", nginx_config)
+
+        nginx_stream_config = nginx_stream_conf.read_text()
+        self.assertIn("listen 5242;", nginx_stream_config)
+        self.assertIn(
+            f"proxy_pass unix:{data_path}/internalapiserver-http.sock;",
+            nginx_stream_config,
+        )
+
+    def test_configure_https_also_has_http_server(self):
+        cert = get_sample_cert_with_cacerts()
+        tempdir = self.make_dir()
+        nginx_conf = Path(tempdir) / "regiond.nginx.conf"
+        nginx_stream_conf = Path(tempdir) / "regiond.nginx.stream.conf"
+        service = http.RegionHTTPService()
+        self.patch(http, "compose_http_config_path").side_effect = [
+            str(nginx_conf),
+            str(nginx_stream_conf),
+        ]
+
+        mock_create_cert_files = self.patch(service, "_create_cert_files")
+        mock_create_cert_files.return_value = ("key_path", "cert_path")
+
+        service._configure(http._Configuration(cert=cert, port=5443))
+
+        nginx_config = nginx_conf.read_text()
+        self.assertIn("listen 5443 ssl http2;", nginx_config)
+        self.assertIn("listen 5240;", nginx_config)
+        self.assertIn("location /MAAS/api/2.0/machines {", nginx_config)
+
+    def test_configure_sets_security_headers(self):
+        cert = get_sample_cert_with_cacerts()
+        nginx_config = self._configure_to_file(
+            http._Configuration(cert=cert, port=5443)
+        )
+        self.assertIn(
+            "add_header X-Content-Type-Options 'nosniff';",
+            nginx_config,
+        )
+
+    def _configure_to_file(self, configuration):
+        tempdir = self.make_dir()
+        nginx_conf = Path(tempdir) / "regiond.nginx.conf"
+        nginx_stream_conf = Path(tempdir) / "regiond.nginx.stream.conf"
+        service = http.RegionHTTPService()
+        self.patch(http, "compose_http_config_path").side_effect = [
+            str(nginx_conf),
+            str(nginx_stream_conf),
+        ]
+        mock_create_cert_files = self.patch(service, "_create_cert_files")
+        mock_create_cert_files.return_value = ("key_path", "cert_path")
+        service._configure(configuration)
+        return nginx_conf.read_text()
+
+    def test_tls_main_server_binds_to_api_bind(self):
+        cert = get_sample_cert_with_cacerts()
+        nginx_config = self._configure_to_file(
+            http._Configuration(
+                cert=cert,
+                port=5443,
+                api_bind=["10.0.0.5", "fd00::5"],
+            )
+        )
+        self.assertIn("listen 10.0.0.5:5443 ssl http2;", nginx_config)
+        self.assertIn("listen [fd00::5]:5443 ssl http2;", nginx_config)
+        self.assertNotIn("listen [::]:5443 ssl http2;", nginx_config)
+
+    def test_hardening_on_ipv4_only_backfills_ipv6_main_bind(self):
+        self.patch(
+            network_module, "get_source_address_for_url"
+        ).return_value = "fd00::9"
+        cert = get_sample_cert_with_cacerts()
+        nginx_config = self._configure_to_file(
+            http._Configuration(
+                cert=cert,
+                port=5443,
+                hardening_active=True,
+                maas_url="http://10.0.0.1:5240/MAAS",
+                api_bind=["10.0.0.5"],
+            )
+        )
+        self.assertIn("listen 10.0.0.5:5443 ssl http2;", nginx_config)
+        self.assertIn("listen [fd00::9]:5443 ssl http2;", nginx_config)
+
+    def test_plain_http_binds_to_api_bind_without_tls(self):
+        nginx_config = self._configure_to_file(
+            http._Configuration(cert=None, port=None, api_bind=["10.0.0.5"])
+        )
+        self.assertIn("listen 10.0.0.5:5240;", nginx_config)
+        self.assertNotIn("listen [::]:5240;", nginx_config)
+
+    def test_wildcard_when_no_bind_and_hardening_off(self):
+        nginx_config = self._configure_to_file(
+            http._Configuration(cert=None, port=None)
+        )
+        self.assertIn("listen [::]:5240;", nginx_config)
+        self.assertIn("listen 5240;", nginx_config)
+
+    def test_hardening_on_derives_api_bind_from_maas_url(self):
+        self.patch(
+            network_module, "get_source_address_for_url"
+        ).return_value = "10.0.0.9"
+        nginx_config = self._configure_to_file(
+            http._Configuration(
+                cert=None,
+                port=None,
+                hardening_active=True,
+                maas_url="http://10.0.0.9:5240/MAAS",
+            )
+        )
+        self.assertIn("listen 10.0.0.9:5240;", nginx_config)
+        self.assertNotIn("listen [::]:5240;", nginx_config)
+        self.assertNotIn("listen 5240;", nginx_config)
+
+    def test_tls_internal_server_binds_to_api_int_bind(self):
+        cert = get_sample_cert_with_cacerts()
+        nginx_config = self._configure_to_file(
+            http._Configuration(
+                cert=cert,
+                port=5443,
+                api_int_bind=["192.168.0.2", "fe80::2"],
+            )
+        )
+        self.assertIn("listen 192.168.0.2:5240;", nginx_config)
+        self.assertIn("listen [fe80::2]:5240;", nginx_config)
+
+    def test_ssl_dhparam_emitted_when_set(self):
+        cert = get_sample_cert_with_cacerts()
+        nginx_config = self._configure_to_file(
+            http._Configuration(
+                cert=cert, port=5443, api_tls_dhparam="/etc/maas/dhparam.pem"
+            )
+        )
+        self.assertIn("ssl_dhparam /etc/maas/dhparam.pem;", nginx_config)
+
+    def test_ssl_dhparam_absent_when_unset(self):
+        cert = get_sample_cert_with_cacerts()
+        nginx_config = self._configure_to_file(
+            http._Configuration(cert=cert, port=5443)
+        )
+        self.assertNotIn("ssl_dhparam", nginx_config)
+
+    def test_ssl_non_fips_includes_x25519_and_chacha20(self):
+        """Non-FIPS mode: X25519 curve and ChaCha20-Poly1305 ciphers present."""
+        cert = get_sample_cert_with_cacerts()
+        self.patch(
+            fips_module, "get_fips_status"
+        ).return_value = fips_module.FIPSStatus(enabled=False)
+        nginx_config = self._configure_to_file(
+            http._Configuration(cert=cert, port=5443)
+        )
+        self.assertIn("X25519:prime256v1:secp384r1", nginx_config)
+        self.assertIn("CHACHA20-POLY1305", nginx_config)
+        self.assertNotIn("ssl_conf_command", nginx_config)
+
+    def test_ssl_fips_omits_x25519_and_chacha20(self):
+        """FIPS mode: X25519 and ChaCha20-Poly1305 must not appear in nginx SSL config."""
+        cert = get_sample_cert_with_cacerts()
+        self.patch(
+            fips_module, "get_fips_status"
+        ).return_value = fips_module.FIPSStatus(enabled=True)
+        nginx_config = self._configure_to_file(
+            http._Configuration(cert=cert, port=5443)
+        )
+        self.assertNotIn("X25519", nginx_config)
+        self.assertNotIn("CHACHA20-POLY1305", nginx_config)
+        self.assertIn("prime256v1:secp384r1", nginx_config)
+        self.assertIn("ECDHE-RSA-AES256-GCM-SHA384", nginx_config)
+        self.assertIn(
+            "ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256;",
+            nginx_config,
+        )
+
+    def test_create_cert_files_writes_full_chain(self):
+        cert = get_sample_cert_with_cacerts()
+        tempdir = Path(self.make_dir())
+        certs_dir = tempdir / "certs"
+        certs_dir.mkdir()
+        self.patch(http, "get_http_config_dir").return_value = tempdir
+
+        service = http.RegionHTTPService()
+        service._create_cert_files(cert)
+        self.assertEqual(
+            (certs_dir / "regiond-proxy.pem").read_text(),
+            cert.fullchain_pem(),
+        )
+        self.assertEqual(
+            (certs_dir / "regiond-proxy-key.pem").read_text(),
+            cert.private_key_pem(),
+        )
+
+    @wait_for_reactor
+    @inlineCallbacks
+    def test_registers_and_unregisters_listener(self):
+        listener = Mock()
+        service = http.RegionHTTPService(postgresListener=listener)
+        self.patch(http.service_monitor, "reloadService")
+        self.patch(service, "_configure")
+
+        yield service.startService()
+        listener.register.assert_called_once_with(
+            "sys_reverse_proxy", service._consume_event
+        )
+
+        yield service.stopService()
+        listener.unregister.assert_called_once_with(
+            "sys_reverse_proxy", service._consume_event
+        )
+
+    @wait_for_reactor
+    @inlineCallbacks
+    def test_unregisters_listener_without_registering(self):
+        listener = Mock()
+        listener.unregister.side_effect = PostgresListenerUnregistrationError(
+            "Channel foo not found"
+        )
+        mock_super_stop = self.patch_autospec(http.Service, "stopService")
+        service = http.RegionHTTPService(postgresListener=listener)
+        yield service.stopService()
+        listener.unregister.assert_called_once_with(
+            "sys_reverse_proxy", service._consume_event
+        )
+        mock_super_stop.assert_called_once_with(service)
+
+    @wait_for_reactor
+    @inlineCallbacks
+    def test_handler_is_called_on_config_change(self):
+        listener = self.make_listener_without_delay()
+        dv = DeferredValue()
+
+        def _handler(channel, payload):
+            dv.set(channel)
+
+        listener.register("sys_reverse_proxy", _handler)
+        self.addCleanup(listener.unregister, "sys_reverse_proxy", _handler)
+        yield listener.startService()
+        yield from self.create_tls_config()
+        try:
+            yield dv.get(timeout=5)
+            self.assertEqual(dv.value, "sys_reverse_proxy")
+        finally:
+            yield listener.stopService()
+
+    @wait_for_reactor
+    @inlineCallbacks
+    def test_data_is_consistent_when_notified(self):
+        cert = get_sample_cert_with_cacerts()
+        listener = self.make_listener_without_delay()
+        dv = DeferredValue()
+
+        def _handler(channel, payload):
+            dv.set(channel)
+
+        listener.register("sys_reverse_proxy", _handler)
+        self.addCleanup(listener.unregister, "sys_reverse_proxy", _handler)
+        yield listener.startService()
+        yield from self.create_tls_config()
+        try:
+            yield dv.get(timeout=5)
+            self.assertEqual(dv.value, "sys_reverse_proxy")
+        finally:
+            yield listener.stopService()
+
+        def get_config():
+            tls_port = Config.objects.get_config("tls_port")
+            tls_secrets = SecretManager().get_composite_secret("tls")
+            return tls_port, tls_secrets
+
+        tls_port, tls_secrets = yield deferToDatabase(get_config)
+        self.assertEqual(tls_port, 5443)
+        self.assertEqual(
+            tls_secrets,
+            {
+                "key": cert.private_key_pem(),
+                "cert": cert.certificate_pem(),
+                "cacert": cert.ca_certificates_pem(),
+            },
+        )

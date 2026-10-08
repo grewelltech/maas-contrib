@@ -1,0 +1,90 @@
+# Security
+
+MAAS enforces strict access control and secure secret management to protect system integrity.
+
+## TLS termination
+
+SSL should be replaced with Transport Layer Security (TLS).  A TLS-terminated load balancer routes incoming Web UI and API requests across region controllers, reducing workload and latency.  Encryption and decryption occur at the edge of the network; in this case, right at the load balancer. TLS better ensures privacy and data integrity through symmetric cryptography and message authentication codes.
+
+### Certificate expiration
+
+When the specified number of days remain until certificate expiration (as defined in the notification reminder), all administrators will see the certificate expiration notification. This notification enumerates the number of days until certificate expiration. It can be dismissed, but once dismissed, it won't appear again.
+
+A certificate expiration check runs every twelve hours. When the certificate has expired, the notification will change to “certificate has expired”.
+
+> Note that MAAS does not auto-renew certificates.
+
+## Security hardening
+
+MAAS security hardening enforces STIG/CIS transport-security controls on the region controller. Hardening is a posture, not a gate: MAAS validates its prerequisites at startup but never refuses to start over an unmet one. A single missing setting on a compliance host is a visible, fixable signal rather than a boot failure that takes a controller offline.
+
+### Activation
+
+Hardening is controlled by the `hardening_enabled` setting. The default value, `auto`, activates hardening when the host is in FIPS mode. An administrator can also activate hardening explicitly on any host with `maas config-hardening enable`, or disable it with `maas config-hardening disable`. On a FIPS host, hardening cannot be turned off. For the relationship between FIPS mode and MAAS, see [FIPS mode](/explanation/fips.md).
+
+### Violations as notifications
+
+When hardening is active, startup validation checks the public-API TLS certificate, DH parameters, service bind addresses, and the PostgreSQL SSL mode. Each unmet prerequisite is posted as an admin-targeted, non-dismissable `error` notification keyed by a stable identifier — the same mechanism the [certificate-expiration check](#certificate-expiration) uses. Because the notifications are non-dismissable, a compliance violation cannot be hidden; it can only be resolved. When the underlying setting is corrected, the notification clears on the next startup. Administrators can also run `maas config-hardening validate` for the same result on demand, which is useful as audit evidence.
+
+This differs from the certificate-expiration notification, which is dismissable — an expiring certificate is a reminder, whereas an active hardening violation is a compliance finding that must be fixed rather than acknowledged.
+
+### Region and rack scope
+
+The notification model lives on the region controller: violations found there are posted as `Notification` rows, visible in the web UI and API. A rack controller applies its own hardening controls locally (its own bind addresses in `rackd.conf`) but has no region-facing channel for posting notifications, so rack-local configuration violations are not surfaced cross-host or recorded in the region database. To audit a rack controller's own hardening posture, run `maas-rack config-hardening validate` on that rack.
+
+See [Security hardening reference](/reference/configuration-guides/security-hardening.md) for the parameters, stores, and violation codes, and [Activate MAAS hardening](/how-to-guides/enhance-maas-security.md#activate-maas-hardening) for setup steps.
+
+## Shared secrets
+
+When you add a new rack or region controller, MAAS asks for a shared secret it will use to communicate with the rest of MAAS. This secret is also exposed in the web UI when you click the 'Add rack controller' button on the Controllers page. MAAS automatically generates this secret when your first region controller installed, and stores the secret in a plain text file. This file is automatically protected with the correct permissions, so there is no need for any action on your part.
+
+As a MAAS administrator, it's crucial to avoid storing secrets associated with your MAAS instance in the database. This includes secrets like the OMAPI key and the RPC secret.
+
+## HashiCorp Vault
+
+Beginning with version 3.3, MAAS secrets are stored in [HashiCorp Vault](https://www.hashicorp.com/products/vault).
+
+Vault employs identity for securing secrets and encryption keys. Its core component is the `kv` secrets engine, which utilizes key-value pairs to store secrets within an encrypted storage managed by Vault. You can explore more about [secrets engines](https://developer.hashicorp.com/vault/docs/secrets) if you're interested.
+
+Vault safeguards the secrets engine using a [barrier view](https://developer.hashicorp.com/vault/docs/secrets#barrier-view), creating a folder with a randomly-generated UUID as the absolute root directory for that engine. This prevents the engine from accessing secrets outside its UUID folder.
+
+Vault is compatible with MAAS version 3.3 and above. Please upgrade if you're using an older version of MAAS and want to use Vault.
+
+> *Learn more about [Hashicorp Vault](https://developer.hashicorp.com/vault/docs).*  
+
+## PostgreSQL security
+
+PostgreSQL contains secrets, and should be encrypted for maximum protection. You should consider [full disk encryption](https://help.ubuntu.com/community/Full_Disk_Encryption_Howto_2019). Also recommended is [TLS encryption between MAAS and PostgreSQL](https://www.postgresql.org/docs/current/ssl-tcp.html).
+
+## Strong passwords
+
+You should pick good passwords and store them securely (e.g. in a KeePassX password database). Perform user administration only via the web UI. Only share the `maas` and `root` user passwords with administrators.
+
+## Valid permissions
+
+MAAS configuration files should be set to have permission `640`: readable by logins belonging to the `maas` group and writeable only by the `root` user. Currently, the `regiond.conf` file contains the login credentials for the PostgreSQL database used by MAAS to keep track of all machines, networks, and configuration.
+
+| Pkg Fmt  | chmod 640 on files...                | Final Perms  |
+|----------|---------------------------------------|--------------|
+| Snap     | `/var/snap/maas/current/regiond.conf` | `-rw-r-----` |
+|          | `/var/snap/maas/current/rackd.conf`   | `-rw-r-----` |
+| Packages | `/etc/maas/rackd.conf/regiond.conf`   | `-rw-r-----` |
+|          | `/etc/maas/rackd.conf/rackd.conf`     | `-rw-r-----` |
+
+## Snap security
+
+Snaps are fully confined or 'sandboxed,' offering inherent security for the enclosed application. For more detailed information, see [this snap blog](https://snapcraft.io/blog/where-eagles-snap-a-closer-look).
+
+## Fine-grained authorization
+
+MAAS 3.8 introduces a built-in relationship-based access control (ReBAC) system for fine-grained authorization. Access follows the chain **user → group → entitlement → resource**: users belong to groups, and groups are granted entitlements (permissions) on resources.
+
+Entitlements are scoped either globally (the `maas` resource) or per resource pool (the `pool` resource). Resource pools are therefore the unit of access control: you can grant a group per-pool entitlements such as `can_view_machines`, `can_deploy_machines`, or `can_edit_machines`, restricting that group to just the machines in the pool. Global machine permissions cascade to every pool, while per-pool entitlements grant additional access to specific pools only.
+
+MAAS enforces these entitlements on every request, so users cannot access machines they are not entitled to, even if they know the system ID. Hiding machines is not security—proper authorization is required.
+
+For the full permission model, the list of available entitlements, and CLI examples, see [User groups and entitlements](/how-to-guides/user-groups-and-entitlements.md).
+
+## Security consulting
+
+If you need help implementing MAAS security, please [contact us](/uncategorized/contact-us.md). We will be happy to assist you in arranging security consulting appropriate to your needs.

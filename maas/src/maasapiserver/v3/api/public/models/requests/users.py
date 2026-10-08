@@ -1,0 +1,191 @@
+# Copyright 2024-2026 Canonical Ltd.  This software is licensed under the
+# GNU Affero General Public License version 3 (see the file LICENSE).
+
+import re
+
+from fastapi import Query
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from maascommon.password_policy import enforce_password_complexity
+from maasservicelayer.builders.users import UserBuilder
+from maasservicelayer.db.filters import Clause
+from maasservicelayer.db.repositories.users import UserClauseFactory
+from maasservicelayer.models.base import UNSET
+
+
+class UsersFiltersParams(BaseModel):
+    ids: list[int] | None = Field(
+        Query(
+            default=None,
+            alias="id",
+            description="Filter by User ID",
+        )
+    )
+
+    username_or_email: str | None = Field(
+        Query(default=None, title="Filter by username or email")
+    )
+
+    def to_clause(self) -> Clause | None:
+        if self.ids:
+            return UserClauseFactory.with_ids(self.ids)
+        if self.username_or_email:
+            return UserClauseFactory.with_username_or_email_like(
+                self.username_or_email
+            )
+        return None
+
+    def to_href_format(self) -> str:
+        parts = []
+        if self.ids:
+            parts.extend([f"id={id}" for id in self.ids])
+        if self.username_or_email:
+            parts.append(f"username_or_email={self.username_or_email}")
+        return "&".join(parts) if parts else ""
+
+
+def _enforce_password_complexity(password: str) -> str:
+    """Reject weak passwords when hardening is active; no-op otherwise.
+
+    Thin adapter over :func:`enforce_password_complexity` that returns the
+    password so it can be used directly as a pydantic validator.
+    """
+    enforce_password_complexity(password)
+    return password
+
+
+class BaseUserRequest(BaseModel):
+    username: str
+    first_name: str
+    last_name: str
+    email: str | None = None
+
+    @field_validator("email")
+    @classmethod
+    def check_email(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        match = re.fullmatch(r"^(?!\.)[\w\.\+\-]+@([\w-]+\.)+[\w-]{2,4}$", v)
+        if not match:
+            raise ValueError("A valid email address must be provided.")
+        return v.lower()
+
+
+class UserCreateRequest(BaseUserRequest):
+    password: str = Field(..., min_length=1)
+    groups: list[int] = Field(
+        default_factory=list,
+        description="The IDs of the groups the user will be a member of.",
+    )
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, v: str) -> str:
+        return _enforce_password_complexity(v)
+
+    async def to_builder(self) -> UserBuilder:
+        hashed_password = await UserBuilder.hash_password(self.password)
+        return UserBuilder(
+            username=self.username,
+            password=hashed_password,
+            is_superuser=False,
+            is_staff=False,
+            is_active=True,
+            first_name=self.first_name,
+            last_name=self.last_name,
+            email=self.email,
+        )
+
+
+class UserUpdateRequestSelf(BaseUserRequest):
+    current_password: str | None = Field(min_length=1, default=None)
+    new_password: str | None = Field(min_length=1, default=None)
+
+    @model_validator(mode="after")
+    def check_passwords(self):
+        if self.new_password is not None and self.current_password is None:
+            raise ValueError(
+                "The current password must be provided when changing password."
+            )
+        return self
+
+    @field_validator("new_password")
+    @classmethod
+    def _check_password(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _enforce_password_complexity(v)
+
+    async def to_builder(self) -> UserBuilder:
+        password = (
+            await UserBuilder.hash_password(self.new_password)
+            if self.new_password is not None
+            else UNSET
+        )
+        return UserBuilder(
+            username=self.username,
+            password=password,
+            is_staff=False,
+            is_active=True,
+            first_name=self.first_name,
+            last_name=self.last_name,
+            email=self.email,
+        )
+
+
+class UserUpdateRequestAdmin(BaseUserRequest):
+    password: str | None = Field(min_length=1, default=None)
+    groups: list[int] = Field(
+        default_factory=list,
+        description="The IDs of the groups the user will be a member of.",
+    )
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _enforce_password_complexity(v)
+
+    async def to_builder(self) -> UserBuilder:
+        password = (
+            await UserBuilder.hash_password(self.password)
+            if self.password is not None
+            else UNSET
+        )
+        return UserBuilder(
+            username=self.username,
+            password=password,
+            is_staff=False,
+            is_active=True,
+            first_name=self.first_name,
+            last_name=self.last_name,
+            email=self.email,
+        )
+
+
+class UserChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=1)
+
+    @field_validator("new_password")
+    @classmethod
+    def _check_password(cls, v: str) -> str:
+        return _enforce_password_complexity(v)
+
+    async def to_builder(self) -> UserBuilder:
+        password = await UserBuilder.hash_password(self.new_password)
+        return UserBuilder(password=password)
+
+
+class UserChangePasswordRequestAdmin(BaseModel):
+    password: str = Field(..., min_length=1)
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, v: str) -> str:
+        return _enforce_password_complexity(v)
+
+    async def to_builder(self) -> UserBuilder:
+        password = await UserBuilder.hash_password(self.password)
+        return UserBuilder(password=password)

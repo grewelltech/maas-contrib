@@ -1,0 +1,39 @@
+name: Update Initial SQL File
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: write
+  packages: read
+
+
+jobs:
+  update-sql:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/${{ github.repository }}-build-env:master
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+    - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98
+      with:
+        token: ${{ secrets.LANDER_GH_TOKEN }}
+    - uses: ./.github/actions/ci-setup
+
+    - name: Update and Commit
+      run: |
+        su ubuntu -c "make update-initial-sql"
+        git config user.name "${{ vars.LANDER_USERNAME }}"
+        git config user.email "${{ vars.LANDER_EMAIL }}"
+        git add src/maasserver/testing/initial.maas_test.sql
+        git status
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        git commit -m "Update initial SQL"
+        git push origin HEAD:master

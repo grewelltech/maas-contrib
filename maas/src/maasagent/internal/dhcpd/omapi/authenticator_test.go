@@ -1,0 +1,74 @@
+// Copyright (c) 2023-2024 Canonical Ltd
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+package omapi
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestHMACSHA256AuthenticatorSign(t *testing.T) {
+	secret := "a2V5" // "key" in base64
+
+	testcases := map[string]struct {
+		in  []byte
+		out []byte
+	}{
+		"empty": {
+			out: []byte{
+				0x5d, 0x5d, 0x13, 0x95, 0x63, 0xc9, 0x5b, 0x59,
+				0x67, 0xb9, 0xbd, 0x9a, 0x8c, 0x9b, 0x23, 0x3a,
+				0x9d, 0xed, 0xb4, 0x50, 0x72, 0x79, 0x4c, 0xd2,
+				0x32, 0xdc, 0x1b, 0x74, 0x83, 0x26, 0x07, 0xd0,
+			},
+		},
+		"nil": {
+			out: []byte{
+				0x5d, 0x5d, 0x13, 0x95, 0x63, 0xc9, 0x5b, 0x59,
+				0x67, 0xb9, 0xbd, 0x9a, 0x8c, 0x9b, 0x23, 0x3a,
+				0x9d, 0xed, 0xb4, 0x50, 0x72, 0x79, 0x4c, 0xd2,
+				0x32, 0xdc, 0x1b, 0x74, 0x83, 0x26, 0x07, 0xd0,
+			},
+		},
+		"message": {
+			in: []byte{
+				// hello world
+				0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64,
+			},
+			out: []byte{
+				0x0b, 0xa0, 0x6f, 0x1f, 0x9a, 0x63, 0x00, 0x46,
+				0x1e, 0x43, 0x45, 0x45, 0x35, 0xdc, 0x3c, 0x42,
+				0x23, 0xe4, 0x7b, 0x1d, 0x35, 0x70, 0x73, 0xd7,
+				0x53, 0x6e, 0xae, 0x90, 0xec, 0x09, 0x5b, 0xe1,
+			},
+		},
+	}
+
+	for name, tc := range testcases {
+		tc := tc
+
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			auth, err := NewHMACSHA256Authenticator("test", secret)
+			assert.NoError(t, err)
+
+			sig := auth.Sign(tc.in)
+			assert.Equal(t, sig, tc.out)
+		})
+	}
+}

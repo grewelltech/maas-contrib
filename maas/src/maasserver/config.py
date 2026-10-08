@@ -1,0 +1,390 @@
+# Copyright 2015-2025 Canonical Ltd.  This software is licensed under the
+# GNU Affero General Public License version 3 (see the file LICENSE).
+
+"""Configuration for the MAAS region."""
+
+from formencode import ForEach
+from formencode.validators import Int
+
+from maascommon.hardening import is_hardening_enabled
+from provisioningserver.config import (
+    Configuration,
+    ConfigurationFile,
+    ConfigurationMeta,
+    ConfigurationOption,
+)
+from provisioningserver.utils.config import (
+    ExtendedURL,
+    OneWayStringBool,
+    UnicodeString,
+)
+from provisioningserver.utils.env import MAAS_ID
+from provisioningserver.utils.network import resolve_connect_address
+
+
+def get_db_creds_vault_path():
+    node_id = MAAS_ID.get()
+    assert node_id, f"MAAS ID not set in {MAAS_ID.path}"
+    return f"controller/{node_id}/database-creds"
+
+
+class RegionConfigurationMeta(ConfigurationMeta):
+    """Local meta-configuration for the MAAS region."""
+
+    envvar = "MAAS_REGION_CONFIG"
+    default = "/etc/maas/regiond.conf"
+    backend = ConfigurationFile
+
+
+class RegionConfiguration(Configuration, metaclass=RegionConfigurationMeta):
+    """Local configuration for the MAAS region."""
+
+    maas_url = ConfigurationOption(
+        "maas_url",
+        "The HTTP URL for the MAAS region.",
+        ExtendedURL(
+            require_tld=False, if_missing="http://localhost:5240/MAAS"
+        ),
+    )
+
+    # This should be considered a fallback scenario as
+    # MAAS should automatically find reachable IP address and use it.
+    broadcast_address = ConfigurationOption(
+        "broadcast_address",
+        "IPv4 address used for communication between Region controllers",
+        UnicodeString(if_missing="", accept_python=False),
+    )
+
+    # Database options.
+    database_host = ConfigurationOption(
+        "database_host",
+        "The address of the PostgreSQL database.",
+        UnicodeString(if_missing="localhost", accept_python=False),
+    )
+    database_port = ConfigurationOption(
+        "database_port",
+        "The port of the PostgreSQL database.",
+        Int(if_missing=5432, accept_python=False, min=1, max=65535),
+    )
+    database_name = ConfigurationOption(
+        "database_name",
+        "The name of the PostgreSQL database.",
+        UnicodeString(if_missing="maasdb", accept_python=False),
+    )
+    database_user = ConfigurationOption(
+        "database_user",
+        "The user to connect to PostgreSQL as.",
+        UnicodeString(if_missing="maas", accept_python=False),
+    )
+    database_pass = ConfigurationOption(
+        "database_pass",
+        "The password for the PostgreSQL user.",
+        UnicodeString(if_missing="", accept_python=False),
+    )
+    database_conn_max_age = ConfigurationOption(
+        "database_conn_max_age",
+        "The lifetime of a database connection, in seconds.",
+        Int(if_missing=(5 * 60), accept_python=False, min=0),
+    )
+    database_keepalive = ConfigurationOption(
+        "database_keepalive",
+        "Whether keepalive for database connections is enabled.",
+        OneWayStringBool(if_missing=True),
+    )
+    database_keepalive_idle = ConfigurationOption(
+        "database_keepalive_idle",
+        "Time (in seconds) after which keepalives will be started.",
+        Int(if_missing=15),
+    )
+    database_keepalive_interval = ConfigurationOption(
+        "database_keepalive_interval",
+        "Interval (in seconds) between keepalives.",
+        Int(if_missing=15),
+    )
+    database_keepalive_count = ConfigurationOption(
+        "database_keepalive_count",
+        "Number of keeaplives that can be lost before connection is reset.",
+        Int(if_missing=2),
+    )
+
+    # Vault options.
+    vault_url = ConfigurationOption(
+        "vault_url",
+        "URL for the Vault server to connect to",
+        UnicodeString(if_missing="", accept_python=False),
+    )
+    vault_secrets_mount = ConfigurationOption(
+        "vault_secrets_mount",
+        "mount path for the Vault KV engine",
+        UnicodeString(if_missing="secret", accept_python=False),
+    )
+    vault_secrets_path = ConfigurationOption(
+        "vault_secrets_path",
+        "path prefix for the MAAS secrets stored in Vault KV engine",
+        UnicodeString(if_missing="", accept_python=False),
+    )
+    vault_approle_id = ConfigurationOption(
+        "vault_approle_id",
+        "Approle ID for Vault authentication",
+        UnicodeString(if_missing="", accept_python=False),
+    )
+    vault_secret_id = ConfigurationOption(
+        "vault_secret_id",
+        "Secret ID for Vault authentication",
+        UnicodeString(if_missing="", accept_python=False),
+    )
+
+    # Worker options.
+    num_workers = ConfigurationOption(
+        "num_workers",
+        "The number of regiond worker process to run.",
+        Int(if_missing=4, accept_python=False, min=1),
+    )
+
+    # Debug options.
+    debug = ConfigurationOption(
+        "debug",
+        "Enable debug mode for detailed error and log reporting.",
+        OneWayStringBool(if_missing=False),
+    )
+    debug_queries = ConfigurationOption(
+        "debug_queries",
+        "Enable query debugging. Reports number of queries and time for all "
+        "actions performed. Requires debug to also be True. mode for detailed "
+        "error and log reporting.",
+        OneWayStringBool(if_missing=False),
+    )
+    debug_http = ConfigurationOption(
+        "debug_http",
+        "Enable HTTP debugging. Logs all HTTP requests and HTTP responses.",
+        OneWayStringBool(if_missing=False),
+    )
+    # Logging format
+    use_json_logging = ConfigurationOption(
+        "use_json_logging",
+        "Control JSON-formatted log output for regiond."
+        "When enabled, regiond log statements as structured JSON objects."
+        "When disabled, logs are emitted in plaintext format.",
+        OneWayStringBool(if_missing=True),
+    )
+
+    # Security hardening is controlled by the DB `Config` row
+    # (`hardening_enabled`, set via `maas config-hardening`); the region
+    # has no per-host conf-based toggle. See
+    # `maasserver.models.config.read_hardening_enabled_from_db`.
+
+    api_bind = ConfigurationOption(
+        "api_bind",
+        "Address(es) the public API server binds to; empty means all "
+        "interfaces. A specific address per family is required when "
+        "hardening is active (each family derived from maas_url if "
+        "unset). May be a list mixing IPv4 and IPv6 addresses.",
+        ForEach(
+            UnicodeString(accept_python=False),
+            convert_to_list=True,
+            if_missing=[],
+        ),
+    )
+    api_int_bind = ConfigurationOption(
+        "api_int_bind",
+        "Address(es) the internal (rack-facing) plain HTTP service "
+        "binds to when TLS is enabled; empty means all interfaces. "
+        "May be a list mixing IPv4 and IPv6 addresses.",
+        ForEach(
+            UnicodeString(accept_python=False),
+            convert_to_list=True,
+            if_missing=[],
+        ),
+    )
+    prometheus_bind = ConfigurationOption(
+        "prometheus_bind",
+        "Address the Prometheus metrics endpoint binds to.",
+        UnicodeString(if_missing=""),
+    )
+    temporal_bind = ConfigurationOption(
+        "temporal_bind",
+        "Address the Temporal services bind to.",
+        UnicodeString(if_missing=""),
+    )
+    rpc_bind = ConfigurationOption(
+        "rpc_bind",
+        "Address(es) the region RPC listener binds to; empty derives a "
+        "specific address from maas_url. May be a list. Rack "
+        "controllers dial these addresses when set, and the maas_url-"
+        "derived address otherwise.",
+        ForEach(
+            UnicodeString(accept_python=False),
+            convert_to_list=True,
+            if_missing=[],
+        ),
+    )
+    agent_api_bind = ConfigurationOption(
+        "agent_api_bind",
+        "Address(es) the internal API server (dialed by maas-agent on "
+        "rack controllers, port 5242) binds to; empty derives a "
+        "specific address per family from maas_url. May be a list "
+        "mixing IPv4 and IPv6 addresses.",
+        ForEach(
+            UnicodeString(accept_python=False),
+            convert_to_list=True,
+            if_missing=[],
+        ),
+    )
+    syslog_bind = ConfigurationOption(
+        "syslog_bind",
+        "Address(es) the syslog service binds to; empty means all "
+        "interfaces. A specific address is required when hardening is "
+        "active (derived from maas_url if unset). May be a list.",
+        ForEach(
+            UnicodeString(accept_python=False),
+            convert_to_list=True,
+            if_missing=[],
+        ),
+    )
+    http_proxy_bind = ConfigurationOption(
+        "http_proxy_bind",
+        "Address(es) the HTTP proxy service binds to; empty means all "
+        "interfaces. A specific address per family is required when "
+        "hardening is active. May be a list mixing IPv4 and IPv6 "
+        "addresses.",
+        ForEach(
+            UnicodeString(accept_python=False),
+            convert_to_list=True,
+            if_missing=[],
+        ),
+    )
+    dns_bind = ConfigurationOption(
+        "dns_bind",
+        "Address(es) the DNS (Bind9) service binds to when hardening "
+        "is active. May be a list mixing IPv4 and IPv6 addresses.",
+        ForEach(
+            UnicodeString(accept_python=False),
+            convert_to_list=True,
+            if_missing=[],
+        ),
+    )
+    dns_allow_transfer = ConfigurationOption(
+        "dns_allow_transfer",
+        "BIND9 allow-transfer ACL value (e.g. 'none', 'trusted').  "
+        "Empty string means: use the hardening default ('none') when "
+        "hardening is active, otherwise omit the directive.",
+        UnicodeString(if_missing=""),
+    )
+    dns_fetches_per_zone = ConfigurationOption(
+        "dns_fetches_per_zone",
+        "BIND9 fetches-per-zone limit.  "
+        "0 means: use the hardening default (100) when hardening is "
+        "active, otherwise omit the directive.",
+        Int(min=0, if_missing=0),
+    )
+    dns_fetches_per_server = ConfigurationOption(
+        "dns_fetches_per_server",
+        "BIND9 fetches-per-server limit.  "
+        "0 means: use the hardening default (100) when hardening is "
+        "active, otherwise omit the directive.",
+        Int(min=0, if_missing=0),
+    )
+
+    database_sslmode = ConfigurationOption(
+        "database_sslmode",
+        "SSL mode for the PostgreSQL connection (e.g. verify-full, verify-ca).",
+        UnicodeString(if_missing="prefer"),
+    )
+    database_sslcert = ConfigurationOption(
+        "database_sslcert",
+        "Path to the client TLS certificate for PostgreSQL mTLS.",
+        UnicodeString(if_missing=""),
+    )
+    database_sslkey = ConfigurationOption(
+        "database_sslkey",
+        "Path to the client TLS key for PostgreSQL mTLS.",
+        UnicodeString(if_missing=""),
+    )
+    database_sslrootcert = ConfigurationOption(
+        "database_sslrootcert",
+        "Path to the CA certificate for verifying the PostgreSQL server.",
+        UnicodeString(if_missing=""),
+    )
+
+    api_tls_cert = ConfigurationOption(
+        "api_tls_cert",
+        "Path to the TLS certificate for the public API endpoint.",
+        UnicodeString(if_missing=""),
+    )
+    api_tls_key = ConfigurationOption(
+        "api_tls_key",
+        "Path to the TLS private key for the public API endpoint.",
+        UnicodeString(if_missing=""),
+    )
+    api_tls_dhparam = ConfigurationOption(
+        "api_tls_dhparam",
+        "Path to the DH parameters file for NGINX TLS (optional).",
+        UnicodeString(if_missing=""),
+    )
+    api_rate_limit_rate = ConfigurationOption(
+        "api_rate_limit_rate",
+        "NGINX rate limit (e.g. '20r/s') applied per client IP.",
+        UnicodeString(if_missing="20r/s"),
+    )
+    api_rate_limit_burst = ConfigurationOption(
+        "api_rate_limit_burst",
+        "NGINX rate limit burst size.",
+        Int(if_missing=60, accept_python=False, min=1),
+    )
+    api_conn_limit = ConfigurationOption(
+        "api_conn_limit",
+        "NGINX concurrent connection limit per client IP.",
+        Int(if_missing=100, accept_python=False, min=1),
+    )
+
+
+def get_temporal_connect_address() -> str:
+    """Return the address this host's Temporal frontend can be reached at.
+
+    Mirrors the resolution `RegionTemporalService` uses to pick Temporal's
+    bind address, so callers always dial whatever address the co-located
+    Temporal server actually bound to instead of assuming `localhost`,
+    which is wrong whenever `temporal_bind` is a specific non-loopback
+    address.
+    """
+    with RegionConfiguration.open() as config:
+        temporal_bind = str(config.temporal_bind)
+        maas_url = str(config.maas_url)
+    return resolve_connect_address(
+        temporal_bind,
+        maas_url,
+        hardening_active=is_hardening_enabled(),
+    )
+
+
+def build_hardening_validation_kwargs(
+    cfg: RegionConfiguration, cert=None
+) -> dict:
+    """Return the kwargs dict for
+    ``maasservicelayer.services.hardening.configure_and_validate_hardening``.
+
+    Reads the bind and database settings from an already-open
+    ``RegionConfiguration`` and the optional MAAS TLS certificate.
+    Callers should add process-specific flags such as ``fips_declared``
+    before calling ``configure_and_validate_hardening``. Lives here (not
+    in ``maasservicelayer``) because it reads ``RegionConfiguration``, a
+    ``maasserver``-only type.
+    """
+    cert_pem = cert.certificate_pem().encode() if cert else None
+    key_pem = cert.private_key_pem().encode() if cert else None
+    return {
+        "api_tls_cert_pem": cert_pem,
+        "api_tls_key_pem": key_pem,
+        "api_tls_dhparam": str(cfg.api_tls_dhparam),
+        "api_bind": list(cfg.api_bind),
+        "api_int_bind": list(cfg.api_int_bind),
+        "prometheus_bind": str(cfg.prometheus_bind),
+        "temporal_bind": str(cfg.temporal_bind),
+        "rpc_bind": list(cfg.rpc_bind),
+        "agent_api_bind": list(cfg.agent_api_bind),
+        "dns_bind": list(cfg.dns_bind),
+        "syslog_bind": list(cfg.syslog_bind),
+        "http_proxy_bind": list(cfg.http_proxy_bind),
+        "database_host": str(cfg.database_host),
+        "database_sslmode": str(cfg.database_sslmode),
+    }

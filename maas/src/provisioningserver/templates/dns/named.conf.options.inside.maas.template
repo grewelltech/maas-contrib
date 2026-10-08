@@ -1,0 +1,38 @@
+{{if upstream_dns}}
+forwarders {
+{{for upstream_dns_address in upstream_dns}}
+    {{upstream_dns_address}};
+{{endfor}}
+};
+{{endif}}
+
+dnssec-validation {{dnssec_validation}};
+empty-zones-enable no;
+
+{{if not upstream_allow_query}}
+allow-query { any; };
+{{endif}}
+{{if not upstream_allow_recursion}}
+allow-recursion { trusted; };
+{{endif}}
+{{if not upstream_allow_query_cache}}
+allow-query-cache { trusted; };
+{{endif}}
+{{if hardening}}
+version "not disclosed";
+{{endif}}
+{{if dns_allow_transfer}}
+allow-transfer { {{dns_allow_transfer}}; };
+{{endif}}
+{{if dns_fetches_per_zone}}
+fetches-per-zone {{dns_fetches_per_zone}};
+{{endif}}
+{{if dns_fetches_per_server}}
+fetches-per-server {{dns_fetches_per_server}};
+{{endif}}
+{{if dns_bind}}
+listen-on { {{for addr in dns_bind}}{{addr}}; {{endfor}}127.0.0.1; };
+{{endif}}
+{{if dns_bind6}}
+listen-on-v6 { {{for addr in dns_bind6}}{{addr}}; {{endfor}}::1; };
+{{endif}}
