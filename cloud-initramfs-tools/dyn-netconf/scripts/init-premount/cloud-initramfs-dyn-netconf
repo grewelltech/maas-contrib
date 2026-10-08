@@ -107,14 +107,22 @@ esac
 
 ## we need to "fix" an IP= string that contains 'BOOTIF'
 ## to instead reference the actual interface.
-wait_for_udev 10
-
 bootif2macaddr "$BOOTIF" && [ -n "$_RET" ] ||
 	fail "failed to convert BOOTIF='$BOOTIF'";
 macaddr=${_RET}
 
-find_nic_by_mac "$macaddr" && [ -n "$_RET" ] ||
-	fail "did no find a nic with $macaddr"
+# best-effort udev settle; non-network hardware (e.g. nfit) can
+# keep the queue busy long after the boot NIC is in sysfs
+wait_for_udev 10 || true
+
+# find the boot NIC by MAC, polling if not immediately present
+n=0
+while :; do
+	find_nic_by_mac "$macaddr" && break
+	n=$((n + 1))
+	[ $n -lt 30 ] || fail "did not find a nic with mac $macaddr"
+	sleep 1
+done
 devname=${_RET}
 
 # now replace occurences of BOOTIF in $IP with $devname
