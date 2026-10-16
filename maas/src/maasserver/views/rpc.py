@@ -12,6 +12,9 @@ import json
 from django.http import HttpResponse
 
 from maasserver.models.node import RegionController
+from maasserver.models.staticipaddress import StaticIPAddress
+from maasserver.routablepairs import find_addresses_between_nodes
+from maasserver.utils import get_remote_ip
 
 
 def get_endpoints():
@@ -52,6 +55,38 @@ def get_endpoints():
     return all_endpoints
 
 
+def _find_requesting_node(request):
+    """Return the node that made `request`, or None if it is not known.
+
+    A rack controller that has not registered yet owns no addresses in the
+    database, so this returns None while it is enlisting and the caller then
+    leaves the endpoint list in its original order.
+    """
+    ip = get_remote_ip(request)
+    if ip is None:
+        return None
+    sip = StaticIPAddress.objects.filter(ip=ip).first()
+    return None if sip is None else sip.get_node()
+
+
+def _rank_addresses_by_locality(node):
+    """Return a key function ordering region addresses as seen from `node`.
+
+    `find_addresses_between_nodes` yields pairs lowest metric first -- same
+    node, then same subnet, then same VLAN, then same space -- so an address's
+    position in that sequence is its order of preference. Addresses it does
+    not report are ranked after every address it does, which keeps them
+    available to a rack that shares nothing with the region while still
+    preferring anything closer.
+    """
+    regions = RegionController.objects.all()
+    ranks = {}
+    for _, _, _, right_ip in find_addresses_between_nodes({node}, regions):
+        ranks.setdefault(str(right_ip), len(ranks))
+    unranked = len(ranks)
+    return lambda endpoint: ranks.get(endpoint[0], unranked)
+
+
 def info(request):
     """View returning a JSON document with information about RPC endpoints.
 
@@ -70,6 +105,18 @@ def info(request):
             endpoints[name].append((addr, port))
         else:
             endpoints[name] = [(addr, port)]
+
+    # Offer each event-loop's addresses closest-first. A rack connects to the
+    # first address that answers, so without an order it reaches the region
+    # over an arbitrary one of the region's addresses, which on a multi-homed
+    # region can be a path that works for the handshake and not afterwards.
+    node = _find_requesting_node(request)
+    if node is not None:
+        rank = _rank_addresses_by_locality(node)
+        endpoints = {
+            name: sorted(addresses, key=rank)
+            for name, addresses in endpoints.items()
+        }
 
     # Each endpoint is an entry point into this event-loop.
     info = {"eventloops": endpoints}
