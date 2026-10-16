@@ -8,7 +8,14 @@ import copy
 import json
 from os import urandom
 import random
-from socket import AF_INET, AF_INET6
+from socket import (
+    AF_INET,
+    AF_INET6,
+    IPPROTO_TCP,
+    TCP_KEEPCNT,
+    TCP_KEEPIDLE,
+    TCP_KEEPINTVL,
+)
 import uuid
 
 from django.db.utils import DatabaseError
@@ -68,6 +75,15 @@ from provisioningserver.utils.twisted import (
 from provisioningserver.utils.version import get_running_version
 
 log = LegacyLogger()
+
+# TCP keepalive settings applied to accepted rack->region RPC connections.
+# A peer that stops responding is detected after roughly
+# IDLE + (INTERVAL * COUNT) seconds, so about two minutes with these values.
+# Rationale: these connections are long-lived and almost entirely idle, and a
+# rack that vanishes without a clean close is otherwise never noticed.
+TCP_KEEPALIVE_IDLE = 60
+TCP_KEEPALIVE_INTERVAL = 15
+TCP_KEEPALIVE_COUNT = 4
 
 
 class Region(SecuredRPCProtocol):
@@ -741,9 +757,43 @@ class RegionServer(Region):
             else:
                 return
 
+    def _enableTcpKeepAlive(self):
+        """Ask the kernel to detect a peer that has stopped responding.
+
+        Nothing at the application level reaps an RPC connection whose peer
+        has gone silent: the region only ever responds to a rack, so it never
+        writes unprompted and never learns that the socket is dead. A close
+        that does not arrive is enough to leak the connection permanently --
+        an asymmetric route through a stateful firewall will drop the peer's
+        FIN, leaving the socket `ESTABLISHED` with empty queues and no kernel
+        timer for the lifetime of the process.
+
+        Each regiond worker has a 1024 descriptor soft limit, so a rack that
+        reconnects on a cycle exhausts the worker, and `EMFILE` there takes
+        down the DHCP config endpoint the rack depends on.
+
+        Failure to set these options is logged and otherwise ignored; an
+        un-reaped connection is better than a refused one.
+        """
+        try:
+            self.transport.setTcpKeepAlive(1)
+            sock = self.transport.getHandle()
+            sock.setsockopt(IPPROTO_TCP, TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
+            sock.setsockopt(
+                IPPROTO_TCP, TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL
+            )
+            sock.setsockopt(IPPROTO_TCP, TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
+        except Exception:
+            log.err(
+                None,
+                "Failed to enable TCP keepalive on an RPC connection; it "
+                "will not be reaped if its peer goes silent.",
+            )
+
     def connectionMade(self):
         super().connectionMade()
         self.connid = str(uuid.uuid4())
+        self._enableTcpKeepAlive()
 
         def trust_connection(authenticated: bool):
             if authenticated:
